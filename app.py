@@ -1,226 +1,282 @@
 import streamlit as st
 import pandas as pd
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from slugify import slugify
 
-# --- CONFIGURAZIONE PAGINA ---
-st.set_page_config(page_title="Universal UTM Manager", layout="wide")
+# --- CONFIGURAZIONE ---
+st.set_page_config(page_title="Universal UTM Governance", layout="wide")
 
-# --- CSS CUSTOM (STILE GRAFICO) ---
+# --- CSS ---
 st.markdown("""
 <style>
-    /* 1. Stile per le TAB (Bottoni grandi) */
+    .validation-box { padding: 10px; border-radius: 5px; margin-bottom: 8px; font-size: 14px; }
+    .valid { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+    .invalid { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+    .warning { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
     div[data-baseweb="tab-list"] { gap: 8px; }
-    button[data-baseweb="tab"] {
-        background-color: #f0f2f6;
-        border-radius: 4px;
-        padding: 10px 24px;
-        font-weight: bold;
-        border: 1px solid #ddd;
-    }
-    button[data-baseweb="tab"][aria-selected="true"] {
-        background-color: #FF4B4B;
-        color: white;
-        border-color: #FF4B4B;
-    }
-
-    /* 2. Stile per la tabella Audit */
-    .status-ok { background-color: #d4edda; color: #155724; }
-    .status-warning { background-color: #fff3cd; color: #856404; }
-    .status-error { background-color: #f8d7da; color: #721c24; }
-    
-    /* 3. Stile compatto per la tabella Guida */
-    div[data-testid="stTable"] {
-        font-size: 12px;
-    }
+    button[data-baseweb="tab"] { background-color: #f0f2f6; font-weight: bold; border: 1px solid #ddd; }
+    button[data-baseweb="tab"][aria-selected="true"] { background-color: #FF4B4B; color: white; border-color: #FF4B4B; }
+    div[data-testid="stTable"] { font-size: 12px; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- UTILS ---
-def normalize_text(text):
-    if not text: return ""
-    return slugify(text, separator="_")
-
-def apply_status_style(val):
-    if "✅" in val: return 'background-color: #d4edda; color: #155724'
-    elif "⚠️" in val: return 'background-color: #fff3cd; color: #856404'
-    elif "❌" in val: return 'background-color: #f8d7da; color: #721c24'
-    return ''
-
-def is_valid_url(url):
-    regex = re.compile(
-        r'^(?:http|ftp)s?://' 
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'
-        r'localhost|'
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
-        r'(?::\d+)?'
-        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
-    return re.match(regex, url) is not None
-
-# --- CONFIGURAZIONE ---
-
-# 1. Mapping Logico (Cosa succede quando selezioni nel dropdown)
-CHANNEL_MAPPING = {
-    "Paid Search": "cpc",
-    "Paid Social": "social_paid",
-    "Display": "cpm",
-    "Video": "cpv",
-    "Programmatic": "cpm",
-    "Email": "email",
-    "Affiliate": "affiliate",
-    "Organic Social": "social_org",
-    "Offline / SMS": "offline",
-    "App Traffic": "app_traffic", # placeholder
-    "Altro": "other"
+# --- MOCK DB ---
+MOCK_CLIENT_DB = {
+    "Chicco (Model 2026)": {
+        "channels": ["Paid Search", "Paid Social", "Display", "Email", "Organic Social", "SMS", "Affiliate", "Video", "Altro"],
+        "default_country": "it",
+        "expected_domain": "chicco.it"
+    },
+    "Ferrarelle (Test)": {
+        "channels": ["Cross-network", "Paid Search", "Display", "Social", "Email"],
+        "default_country": "it",
+        "expected_domain": "ferrarelle.it"
+    }
 }
 
-# 2. Dati per la Tabella Guida (Copia fedele dell'immagine)
+# --- DATI GUIDA ---
 GUIDE_TABLE_DATA = [
-    {"Traffic type": "Organic", "utm_medium": "organic", "utm_source": "google, bing, yahoo..."},
-    {"Traffic type": "Referral", "utm_medium": "referral", "utm_source": "[website domain]"},
+    {"Traffic type": "Organic", "utm_medium": "organic", "utm_source": "google, bing, yahoo"},
+    {"Traffic type": "Referral", "utm_medium": "referral", "utm_source": "(domain)"},
     {"Traffic type": "Direct", "utm_medium": "(none)", "utm_source": "(direct)"},
-    {"Traffic type": "Paid campaign", "utm_medium": "cpc", "utm_source": "google, bing..."},
-    {"Traffic type": "Affiliate campaign", "utm_medium": "affiliate", "utm_source": "tradetracker..."},
-    {"Traffic type": "Display campaign", "utm_medium": "cpm", "utm_source": "reservation, display..."},
-    {"Traffic type": "Video campaign", "utm_medium": "cpv", "utm_source": "youtube..."},
-    {"Traffic type": "Programmatic", "utm_medium": "cpm", "utm_source": "rcs, mediamond, rai..."},
-    {"Traffic type": "Organic email", "utm_medium": "email", "utm_source": "newsletter, email, crm"},
-    {"Traffic type": "Social organic", "utm_medium": "social_org", "utm_source": "facebook, instagram..."},
-    {"Traffic type": "Social paid", "utm_medium": "social_paid", "utm_source": "facebook, instagram..."},
+    {"Traffic type": "Paid Search", "utm_medium": "cpc", "utm_source": "google, bing"},
+    {"Traffic type": "Affiliate", "utm_medium": "affiliate", "utm_source": "tradetracker, awin"},
+    {"Traffic type": "Display", "utm_medium": "cpm", "utm_source": "reservation, display, dv360, google"},
+    {"Traffic type": "Video", "utm_medium": "cpv", "utm_source": "youtube, vimeo, google"},
+    {"Traffic type": "Programmatic", "utm_medium": "cpm", "utm_source": "rcs, mediamond, rai, manzoni"},
+    {"Traffic type": "Email", "utm_medium": "email|mailing_campaign", "utm_source": "newsletter, email, crm, sfmc, mailchimp"},
+    {"Traffic type": "Organic Social", "utm_medium": "social_org", "utm_source": "facebook, instagram, tiktok, linkedin, pinterest"},
+    {"Traffic type": "Paid Social", "utm_medium": "social_paid", "utm_source": "facebook, instagram, tiktok, linkedin, pinterest"},
     {"Traffic type": "App traffic", "utm_medium": "-", "utm_source": "app"},
-    {"Traffic type": "Offline", "utm_medium": "offline", "utm_source": "brochure, qr_code, sms"},
+    {"Traffic type": "SMS", "utm_medium": "offline", "utm_source": "sms"},
+    {"Traffic type": "Altro", "utm_medium": "other", "utm_source": ""},
 ]
 
-# --- FUNZIONI MOCK ---
-def get_mock_audit_post_campaign():
-    data = [
-        {"Campagna": "Saldi inverno jeans donna", "Periodo": "10-31/01/2026", "UTM (source/medium)": "meta / paid_social", "Sessions": 532, "Canale Atteso": "Paid Social", "Canale Osservato": "Paid Social", "Stato Tracking": "✅ OK - Tracking corretto"},
-        {"Campagna": "DEM Welcome Firenze", "Periodo": "01-31/01/2026", "UTM (source/medium)": "sfmc / email", "Sessions": 0, "Canale Atteso": "Email", "Canale Osservato": "-", "Stato Tracking": "❌ Nessun traffico rilevato"},
-        {"Campagna": "Remarketing carrello IT", "Periodo": "10-31/01/2026", "UTM (source/medium)": "meta / paid_social", "Sessions": 120, "Canale Atteso": "Paid Social", "Canale Osservato": "Unassigned", "Stato Tracking": "⚠️ Canale errato (Unassigned)"}
-    ]
-    return pd.DataFrame(data)
+# --- LOGICA DINAMICA ---
+def get_source_options():
+    sources = set()
+    for row in GUIDE_TABLE_DATA:
+        parts = row["utm_source"].split(",")
+        for p in parts:
+            clean = p.strip().replace("...", "")
+            if clean and "(" not in clean and "[" not in clean:
+                sources.add(clean)
+    return [""] + sorted(list(sources)) + ["Altro (Inserisci manuale)"]
 
-# --- INTERFACCIA UTENTE ---
+SOURCE_OPTIONS = get_source_options()
 
-# 1. SIDEBAR
-st.sidebar.header("1. Configurazione Campagna")
+def get_compatible_channels(selected_source, all_client_channels):
+    if not selected_source or selected_source == "Altro (Inserisci manuale)":
+        return [""] + all_client_channels
+    norm_source = selected_source.strip().lower()
+    compatible_types = set()
+    for row in GUIDE_TABLE_DATA:
+        row_sources = [s.strip().lower() for s in row["utm_source"].split(",")]
+        if norm_source in row_sources:
+            compatible_types.add(row["Traffic type"])
+    if not compatible_types:
+        return [""] + all_client_channels
+    filtered_channels = [c for c in all_client_channels if c in compatible_types]
+    if not filtered_channels:
+        return [""] + all_client_channels
+    return [""] + sorted(filtered_channels)
+
+# --- UTILS ---
+def normalize_token(text):
+    if not text: return ""
+    return slugify(text, separator="-", lowercase=True)
+
+def validate_token(text, field_name, is_mandatory=True):
+    if not text:
+        if is_mandatory:
+            return False, f'<div class="validation-box invalid">❌ <b>{field_name}</b> è obbligatorio.</div>', ""
+        else:
+            return True, "", "" 
+    normalized = normalize_token(text)
+    if text != normalized:
+        return False, f'<div class="validation-box warning">⚠️ <b>{field_name}</b> formato errato.<br>Consigliato: <code>{normalized}</code></div>', normalized
+    return True, f'<div class="validation-box valid">✅ <b>{field_name}</b> OK</div>', normalized
+
+def validate_url_logic(url, expected_domain):
+    regex = re.compile(r'^https?://(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|localhost|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::\d+)?(?:/?|[/?]\S+)$', re.IGNORECASE)
+    if not re.match(regex, url):
+        return False, f'<div class="validation-box invalid">❌ <b>URL</b> non valido. (Es. https://www.chicco.it)</div>'
+    if expected_domain and expected_domain not in url:
+        return True, f'<div class="validation-box warning">⚠️ <b>URL</b> valido ma dominio sospetto (atteso: <b>{expected_domain}</b>).</div>'
+    return True, f'<div class="validation-box valid">✅ <b>URL</b> valido e coerente</div>'
+
+# --- UI SIDEBAR ---
+st.sidebar.title("1. Configurazione")
+
+selected_prop_name = st.sidebar.selectbox("Property GA4", list(MOCK_CLIENT_DB.keys()))
+prop_config = MOCK_CLIENT_DB[selected_prop_name]
+
 st.sidebar.markdown("---")
+st.sidebar.subheader("Sorgente e Canale")
 
+# 1. SCELTA SORGENTE
+selected_source_option = st.sidebar.selectbox(
+    "Piattaforma / Source (Obbligatorio)", 
+    SOURCE_OPTIONS,
+    help="Su quale piattaforma o canale stai attivando questa campagna?"
+)
+final_input_source = st.sidebar.text_input("Inserisci Source Manuale", placeholder="es. nuova-piattaforma") if selected_source_option == "Altro (Inserisci manuale)" else selected_source_option
+
+# 2. SCELTA CANALE
+available_channels_filtered = get_compatible_channels(final_input_source, prop_config["channels"])
+sel_channel = st.sidebar.selectbox(
+    "Channel Grouping (Opzionale)", 
+    available_channels_filtered,
+    help="In quale channel grouping vuoi che venga raccolto il traffico di questa campagna? Nota: se la sorgente è ambigua (es. Facebook), questo campo è obbligatorio."
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Destinazione")
+domain_hint = prop_config.get('expected_domain', '')
 destination_url = st.sidebar.text_input(
     "URL di destinazione", 
-    value="https://www.site.com/",
-    help="Dove atterrerà l’utente quando clicca sulla CTA? (Deve iniziare con http:// o https://)"
+    value="https://", 
+    help=f"Dove atterrerà l’utente quando clicca sulla CTA? Inserisci l'URL completo (Atteso: {domain_hint})"
 )
 
-campaign_name_internal = st.sidebar.text_input(
-    "Nome Campagna (Interno)", 
-    placeholder="es. promo_saldi",
-    help="Come chiameresti questa campagna internamente? Serve per identificarla in fase di analisi."
+st.sidebar.markdown("---")
+st.sidebar.subheader("Naming Campagna")
+st.sidebar.caption("Pattern: `Country_Type_Name_Date_CTA`")
+
+inp_country = st.sidebar.text_input(
+    "Country / Lingua *", 
+    value=prop_config["default_country"], 
+    help="In che lingua è la comunicazione principale di questa campagna?"
 )
 
-selected_grouping = st.sidebar.selectbox(
-    "Channel Grouping (GA4)", 
-    list(CHANNEL_MAPPING.keys()),
-    help="In quale channel grouping vuoi che venga raccolto il traffico di questa campagna?"
+inp_type = st.sidebar.text_input(
+    "Campaign Type (Goal)", 
+    placeholder="es. promo", 
+    help="Che tipo di campagna è? awarness (awr), conversion (cnv), ecc."
 )
 
-platform_source = st.sidebar.text_input(
-    "Piattaforma / Source", 
-    placeholder="es. google, meta, newsletter",
-    help="Su quale piattaforma o canale stai attivando questa campagna? (google, youtube, newsletter...)"
+inp_name = st.sidebar.text_input(
+    "Campaign Name *", 
+    placeholder="es. saldi-invernali", 
+    help="Come chiameresti questa campagna internamente?"
 )
 
-start_date = st.sidebar.date_input(
-    "Data Inizio Campagna", 
-    datetime.today(),
+inp_date = st.sidebar.date_input(
+    "Data Partenza *", 
+    datetime.today(), 
     help="Quando partirà la campagna?"
 )
 
-extra_details = st.sidebar.text_input(
-    "Dettagli Extra (es. Paese)", 
-    value="it",
-    help="Qual è il paese principale target della campagna?"
-)
-
-cta_creative = st.sidebar.text_input(
-    "CTA / Creatività (Opzionale)", 
-    placeholder="es. shop_now",
+inp_cta = st.sidebar.text_input(
+    "CTA / Creatività", 
+    placeholder="es. shop-now", 
     help="Qual è la CTA o il nome della creatività che vuoi tracciare?"
 )
 
-# 2. MAIN TITLE
-st.title("🌐 UTM Manager & Audit Tool")
 
-# 3. TABS
-tab_builder, tab_audit = st.tabs(["🛠️ Builder (Crea Link)", "📊 Audit (Controlla Dati)"])
+# --- MAIN PAGE ---
+st.title("🛡️ Universal UTM Governance")
+tab_builder, tab_audit = st.tabs(["🛠️ Builder & Validazione", "📊 Audit Storico"])
 
-# === TAB 1: BUILDER ===
 with tab_builder:
-    # Layout colonne: aumentato spazio per la guida (60% risultati, 40% guida)
     col_results, col_guide = st.columns([0.60, 0.40], gap="large")
 
     with col_results:
-        st.subheader("Generazione Link")
-        st.caption("Compila il form a sinistra e premi il bottone per generare.")
+        st.subheader("Controllo Qualità")
         
-        btn_generate = st.button("Genera Link UTM", type="primary")
+        all_valid = True
+        corrections_needed = False
 
-        if btn_generate:
-            if not is_valid_url(destination_url):
-                st.error("⛔ **Errore URL**: L'URL di destinazione non è valido. Assicurati che inizi con `http://` o `https://`.")
-            else:
-                st.divider()
+        # 1. URL CHECK
+        url_ok, url_msg = validate_url_logic(destination_url, prop_config.get("expected_domain"))
+        st.markdown(url_msg, unsafe_allow_html=True)
+        if "invalid" in url_msg: all_valid = False
+
+        # 2. SOURCE CHECK
+        is_val_src, msg_src, corr_src = validate_token(final_input_source, "Source", is_mandatory=True)
+        st.markdown(msg_src, unsafe_allow_html=True)
+        if not is_val_src:
+            if corr_src: corrections_needed = True
+            else: all_valid = False
+
+        # 3. CHANNEL CHECK (Anti-Ambiguità)
+        real_channel_options = [c for c in available_channels_filtered if c]
+        if len(real_channel_options) > 1 and not sel_channel:
+            st.markdown(f'<div class="validation-box invalid">❌ <b>Channel Grouping</b> mancante. <br>La sorgente <b>{final_input_source}</b> è ambigua, devi specificare il canale.</div>', unsafe_allow_html=True)
+            all_valid = False
+        elif final_input_source and not sel_channel and not real_channel_options:
+             st.markdown(f'<div class="validation-box warning">⚠️ <b>Channel Grouping</b> non specificato.</div>', unsafe_allow_html=True)
+        elif sel_channel:
+             st.markdown(f'<div class="validation-box valid">✅ <b>Channel</b>: {sel_channel}</div>', unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.markdown("**Validazione Naming Campagna:**")
+
+        # 4. CAMPAIGN TOKENS
+        token_configs = [
+            ("Country", inp_country, True),
+            ("Type", inp_type, False),
+            ("Name", inp_name, True),
+            ("CTA", inp_cta, False)
+        ]
+
+        c1, c2 = st.columns(2)
+        campaign_tokens_clean = []
+        for i, (label, val, mandatory) in enumerate(token_configs):
+            with (c1 if i % 2 == 0 else c2):
+                is_val, msg, corrected = validate_token(val, label, is_mandatory=mandatory)
+                if msg: st.markdown(msg, unsafe_allow_html=True)
+                if not is_val:
+                    if corrected: corrections_needed = True
+                    else: all_valid = False
                 
-                # 1. Logica
-                p_medium = CHANNEL_MAPPING.get(selected_grouping, "other")
-                p_source = normalize_text(platform_source) or "not_specified"
-                date_str = start_date.strftime("%Y%m%d")
-                clean_name = normalize_text(campaign_name_internal)
-                clean_extra = normalize_text(extra_details)
-                p_campaign = f"{clean_extra}_{clean_name}_{date_str}"
-                p_content = normalize_text(cta_creative)
+                final_val = corrected if corrected else val
+                if final_val: campaign_tokens_clean.append(final_val)
 
-                separator = "&" if "?" in destination_url else "?"
-                final_url = f"{destination_url}{separator}utm_source={p_source}&utm_medium={p_medium}&utm_campaign={p_campaign}"
-                if p_content: final_url += f"&utm_content={p_content}"
+        # Composizione
+        date_str = inp_date.strftime("%Y%m%d")
+        ordered_parts = [
+            normalize_token(inp_country),
+            normalize_token(inp_type),
+            normalize_token(inp_name),
+            date_str,
+            normalize_token(inp_cta)
+        ]
+        final_campaign = "_".join([p for p in ordered_parts if p])
+        final_medium = normalize_token(sel_channel) if sel_channel else "not-set"
 
-                # 2. Output
-                st.success("✅ Link generato")
-                st.markdown("**URL Finale:**")
-                st.code(final_url, language="text")
+        st.divider()
+
+        # --- OUTPUT ---
+        if not all_valid and not corrections_needed:
+            st.error("⛔ Correggi errori bloccanti.")
+        
+        elif corrections_needed:
+            st.warning("⚠️ Formattazione da correggere.")
+            if st.button("Correggi e Genera", type="primary"):
+                sep = "&" if "?" in destination_url else "?"
+                final_url = f"{destination_url}{sep}utm_source={corr_src}&utm_medium={final_medium}&utm_campaign={final_campaign}"
+                if normalize_token(inp_cta): final_url += f"&utm_content={normalize_token(inp_cta)}"
+
+                st.success("✅ Generato (Corretto)")
+                st.code(final_url)
+                st.json({"source": corr_src, "medium": final_medium, "campaign": final_campaign})
+        
+        else:
+            if st.button("Genera Link UTM", type="primary"):
+                sep = "&" if "?" in destination_url else "?"
+                final_url = f"{destination_url}{sep}utm_source={corr_src}&utm_medium={final_medium}&utm_campaign={final_campaign}"
+                if normalize_token(inp_cta): final_url += f"&utm_content={normalize_token(inp_cta)}"
                 
-                st.markdown("**Parametri:**")
-                st.json({
-                    "utm_source": p_source,
-                    "utm_medium": p_medium, 
-                    "utm_campaign": p_campaign,
-                    "utm_content": p_content
-                })
+                st.success("✅ Link Pronto")
+                st.code(final_url)
+                st.json({"source": corr_src, "medium": final_medium, "campaign": final_campaign})
 
     with col_guide:
         st.markdown("### 📖 Guida Naming")
-        st.info("Riferimento standard per Source e Medium")
-        
-        # Creazione Tabella dalla struttura dati definita sopra
-        df_guide = pd.DataFrame(GUIDE_TABLE_DATA)
-        # Visualizzazione tabella statica
-        st.table(df_guide)
+        st.table(pd.DataFrame(GUIDE_TABLE_DATA))
 
-# === TAB 2: AUDIT ===
 with tab_audit:
-    st.header("Audit Campagne Attive")
-    st.markdown("Controllo coerenza dati post-lancio (Simulazione GA4/BigQuery)")
-    
-    col_filters, col_action = st.columns([3, 1])
-    with col_filters:
-        audit_period = st.date_input("Periodo di analisi", (datetime.today() - timedelta(days=30), datetime.today()))
-    with col_action:
-        st.write("") 
-        st.write("") 
-        btn_run_audit = st.button("Aggiorna Dati", type="primary")
-
-    if btn_run_audit:
-        st.write("---")
-        df_audit = get_mock_audit_post_campaign()
-        st.dataframe(df_audit.style.applymap(apply_status_style, subset=['Stato Tracking']), use_container_width=True, hide_index=True)
+    st.header("Audit Campagne")
+    st.info("Connessione GA4 in attesa.")
