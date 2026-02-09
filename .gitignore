@@ -12,6 +12,7 @@ ENV/
 # Google Auth & Sensitive Data
 token.json
 client_secrets.json
+api_keys.json
 .env
 
 # IDEs

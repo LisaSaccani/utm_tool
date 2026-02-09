@@ -154,6 +154,133 @@ st.markdown("""
         max-width: 800px !important;
         margin: 0 auto !important;
     }
+
+    /* 6. FLOATING CHAT WIDGET (WR ASSISTANT STYLE) */
+    .chat-fab-container {
+        position: fixed;
+        bottom: 30px;
+        right: 30px;
+        z-index: 10000;
+        cursor: pointer;
+    }
+    
+    .chat-fab-icon {
+        width: 80px;
+        height: 80px;
+        border-radius: 50%;
+        background-color: white;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border: 2px solid #0052cc;
+        overflow: hidden;
+    }
+
+    .chat-window {
+        position: fixed;
+        bottom: 120px;
+        right: 30px;
+        width: 400px;
+        height: 600px;
+        background: white;
+        border-radius: 12px;
+        box-shadow: 0 10px 40px rgba(0,0,0,0.25);
+        z-index: 9999;
+        display: flex;
+        flex-direction: column;
+        border: 2px solid #5fb12e; /* Green border from screenshot */
+        overflow: hidden;
+        font-family: 'Courier New', Courier, monospace; /* To match the slightly retro font in screenshot */
+    }
+    
+    .chat-header {
+        padding: 15px 20px;
+        background: #0052cc; /* Blue */
+        color: white;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    .chat-header .title-area {
+        display: flex;
+        align-items: center;
+        gap: 15px;
+    }
+
+    .avatar-container {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        margin-bottom: 20px;
+    }
+
+    .avatar-icon {
+        width: 45px;
+        height: 45px;
+        border-radius: 8px;
+        background: white;
+        border: 1px solid #ddd;
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+    }
+
+    .chat-msg-bot {
+        background-color: #0052cc;
+        color: white;
+        padding: 12px 18px;
+        border-radius: 10px;
+        font-size: 14px;
+        line-height: 1.4;
+        max-width: 80%;
+    }
+
+    .chat-msg-user {
+        background-color: white;
+        border: 1px solid #e0e0e0;
+        color: #333;
+        padding: 12px 18px;
+        border-radius: 10px;
+        font-size: 14px;
+        line-height: 1.4;
+        max-width: 80%;
+        margin-left: auto;
+    }
+
+    .user-message-row {
+        display: flex;
+        justify-content: flex-end;
+        align-items: flex-start;
+        gap: 10px;
+        margin-bottom: 20px;
+    }
+
+    .user-avatar {
+        width: 45px;
+        height: 45px;
+        border-radius: 8px;
+        background: #f0f4f9;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid #ddd;
+    }
+
+    /* Input Style */
+    .stChatInput {
+        border-top: 1px solid #eee !important;
+        padding: 10px !important;
+    }
+    
+    .stChatInput button {
+        background: none !important;
+        border: none !important;
+        color: #333 !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -524,124 +651,7 @@ def show_dashboard():
                 st.table(pd.DataFrame(GUIDE_TABLE_DATA))
 
             st.markdown("---")
-            st.markdown("### 💬 Costruiamolo insieme")
-            st.markdown("### 💬 Assistente Virtuale GA4 (Powered by Gemini)")
-            st.caption("Chiedi al tuo assistente di analizzare i dati o suggerire strategie. (Es. 'Quante sessioni da Organic Social negli ultimi 30 giorni?')")
-
-            # 1. API Key Config
-            api_key = st.text_input("🔑 Gemini API Key", type="password", help="Ottienila su aistudio.google.com")
-            
-            if not api_key:
-                st.info("👆 Inserisci la tua Gemini API Key per attivare l'agente.")
-            else:
-                try:
-                    genai.configure(api_key=api_key)
-                    
-                    # 2. Define Tools with Creds Injection
-                    creds = st.session_state.credentials
-
-                    def tool_list_properties():
-                        """List all GA4 accounts and properties accessible to the user."""
-                        return ga4_mcp_tools.get_account_summaries(creds)
-
-                    def tool_run_report(property_id: str, dimensions: list[str], metrics: list[str], start_date: str = "30daysAgo", end_date: str = "today"):
-                        """
-                        Runs a GA4 report.
-                        Args:
-                            property_id: The GA4 Property ID (e.g. 'properties/123456').
-                            dimensions: List of dimensions (e.g. ['sessionSource', 'country']).
-                            metrics: List of metrics (e.g. ['sessions', 'conversions']).
-                            start_date: Start date (YYYY-MM-DD or '30daysAgo').
-                            end_date: End date (YYYY-MM-DD or 'today').
-                        """
-                        dr = [{"start_date": start_date, "end_date": end_date}]
-                        return ga4_mcp_tools.run_report(property_id, dimensions, metrics, dr, creds)
-                    
-                    def tool_get_metadata(property_id: str):
-                        """Get details about a specific property."""
-                        return ga4_mcp_tools.get_property_details(property_id, creds)
-
-                    my_tools = [tool_list_properties, tool_run_report, tool_get_metadata]
-                    
-                    # 3. Model Selection (Silent)
-                    try:
-                        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-                        gemini_models = [m for m in available_models if "gemini" in m]
-                        
-                        # Search for "gemini-3" first (future proof), then "gemini-2.0", then "gemini-1.5-flash"
-                        target_model = None
-                        for keyword in ["gemini-3", "gemini-2.0", "gemini-1.5-flash-latest", "gemini-1.5-flash"]:
-                            for m in gemini_models:
-                                if keyword in m:
-                                    target_model = m
-                                    break
-                            if target_model: break
-                        
-                        if not target_model:
-                            target_model = "models/gemini-1.5-flash"
-                        
-                        selected_model_name = target_model
-                        
-                    except Exception:
-                        selected_model_name = "models/gemini-1.5-flash"
-
-                    # Session & Model Init
-                    if "current_model" not in st.session_state:
-                         st.session_state.current_model = selected_model_name
-                         st.session_state.chat_session = None
-
-                    if st.session_state.current_model != selected_model_name:
-                         st.session_state.chat_session = None
-                         st.session_state.current_model = selected_model_name
-
-                    if st.session_state.chat_session is None:
-                        model = genai.GenerativeModel(selected_model_name, tools=my_tools)
-                        st.session_state.chat_session = model.start_chat(enable_automatic_function_calling=True)
-                    
-                    # 4. UI Chat Interface (Gemini Style)
-                    st.markdown('<div class="gemini-container">', unsafe_allow_html=True)
-                    chat_container = st.container(height=500, border=False)
-                    
-                    with chat_container:
-                        for msg in st.session_state.messages:
-                            if msg["role"] == "user":
-                                st.markdown(f"""
-                                <div class="gemini-msg gemini-msg-user">
-                                    <div class="bubble">{msg["content"]}</div>
-                                </div>
-                                """, unsafe_allow_html=True)
-                            else:
-                                st.markdown(f"""
-                                <div class="gemini-msg gemini-msg-assistant">
-                                    <div class="avatar"></div>
-                                    <div class="content">{msg["content"]}</div>
-                                </div>
-                                """, unsafe_allow_html=True)
-
-                    if prompt := st.chat_input("Chiedi a Gemini...", key="gemini_chat_input"):
-                        st.session_state.messages.append({"role": "user", "content": prompt})
-                        with chat_container:
-                             st.markdown(f'<div class="gemini-msg gemini-msg-user"><div class="bubble">{prompt}</div></div>', unsafe_allow_html=True)
-                        
-                        with st.spinner(" "): # Spazio vuoto per non disturbare la UI
-                            try:
-                                response = st.session_state.chat_session.send_message(prompt)
-                                text_response = response.text
-                                
-                                st.session_state.messages.append({"role": "assistant", "content": text_response})
-                                with chat_container:
-                                    st.markdown(f"""
-                                    <div class="gemini-msg gemini-msg-assistant">
-                                        <div class="avatar"></div>
-                                        <div class="content">{text_response}</div>
-                                    </div>
-                                    """, unsafe_allow_html=True)
-                            except Exception as e:
-                                st.error(f"Errore durante la chat: {e}")
-                    st.markdown('</div>', unsafe_allow_html=True)
-
-                except Exception as e:
-                    st.error(f"Errore configurazione Gemini: {e}")
+            st.info("💡 Usa l'assistente in basso a destra per analizzare i dati o suggerire strategie.")
 
     # ==============================================================================
     # TAB 2: UTM CHECKER (CORRETTO E PULITO)
@@ -740,18 +750,199 @@ def show_dashboard():
                 except Exception as e:
                     st.error(f"Errore analisi URL: {e}")
 
+    # --- FLOATING CHATBOT WIDGET ---
+    render_chatbot_widget()
+
+def get_user_email(creds):
+    """Estrae l'email dall'utente autenticato"""
+    try:
+        from googleapiclient.discovery import build
+        service = build('oauth2', 'v2', credentials=creds)
+        user_info = service.userinfo().get().execute()
+        return user_info.get('email')
+    except Exception as e:
+        return None
+
+def get_persistent_api_key(email):
+    """Recupera la chiave API salvata per l'utente"""
+    if not email: return None
+    keys_path = os.path.join(os.path.dirname(__file__), 'api_keys.json')
+    if os.path.exists(keys_path):
+        with open(keys_path, 'r') as f:
+            try:
+                keys = json.load(f)
+                return keys.get(email)
+            except:
+                return None
+    return None
+
+def save_persistent_api_key(email, key):
+    """Salva la chiave API per l'utente"""
+    if not email or not key: return
+    keys_path = os.path.join(os.path.dirname(__file__), 'api_keys.json')
+    keys = {}
+    if os.path.exists(keys_path):
+        with open(keys_path, 'r') as f:
+            try:
+                keys = json.load(f)
+            except:
+                keys = {}
+    keys[email] = key
+    with open(keys_path, 'w') as f:
+        json.dump(keys, f)
+
+def render_chatbot_widget():
+    """Renderizza il widget flottante della chat con stile WR Assistant (Blu/Bianco)"""
+    if "chat_visible" not in st.session_state:
+        st.session_state.chat_visible = False
+    
+    # Recupera l'email per la persistenza
+    if "user_email" not in st.session_state:
+        st.session_state.user_email = get_user_email(st.session_state.credentials)
+    
+    email = st.session_state.user_email
+    
+    # Verifica chiave persistente
+    if "gemini_api_key" not in st.session_state or not st.session_state.gemini_api_key:
+        st.session_state.gemini_api_key = get_persistent_api_key(email) or ""
+
+    # Bottone Flottante (Fixed con Icona Robot)
+    st.markdown("""<div class="chat-fab-container">""", unsafe_allow_html=True)
+    
+    # Icona base64 se disponibile
+    import base64
+    icon_path = os.path.join(os.path.dirname(__file__), 'robot_icon.png')
+    bot_img_tag = '🤖'
+    if os.path.exists(icon_path):
+        with open(icon_path, "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode()
+            bot_img_tag = f'<img src="data:image/png;base64,{encoded_string}" style="width:100%; height:100%; object-fit:cover;">'
+            st.markdown(f'<div class="chat-fab-icon">{bot_img_tag}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="chat-fab-icon" style="font-size: 50px;">🤖</div>', unsafe_allow_html=True)
+    
+    # Overlay button per catturare il click di Streamlit
+    if st.button(" ", key="chat_fab_trigger", help="Apri WR Assistant", use_container_width=False):
+        st.session_state.chat_visible = not st.session_state.chat_visible
+        st.rerun()
+        
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if not st.session_state.chat_visible:
+        return
+
+    # Finestra di Chat (Stile WR Assistant)
+    st.markdown('<div class="chat-window">', unsafe_allow_html=True)
+    
+    # Header della finestra
+    header_bot_icon = bot_img_tag if '<img' in bot_img_tag else '🤖'
+    st.markdown(f"""
+    <div class="chat-header">
+        <div class="title-area">
+            <div style="width:30px; height:30px; background:white; border-radius:50%; display:flex; align-items:center; justify-content:center; padding:2px; overflow:hidden;">
+                {header_bot_icon}
+            </div>
+            <span style="font-weight:600; font-size:16px;">WR Assistant</span>
+        </div>
+        <div>
+            <span style="cursor:pointer; font-size:24px;">✕</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Area Core Chat
+    chat_main_col = st.container()
+    with chat_main_col:
+        # Configurazione API se manca
+        if not st.session_state.gemini_api_key:
+            st.warning("⚠️ Configurazione richiesta")
+            with st.form("api_key_form"):
+                new_key = st.text_input("Inserisci la tua Gemini API Key per iniziare:", type="password")
+                if st.form_submit_button("Attiva Assistant"):
+                    save_persistent_api_key(email, new_key)
+                    st.session_state.gemini_api_key = new_key
+                    st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
+            return
+
+        # Logica Chat
+        try:
+            genai.configure(api_key=st.session_state.gemini_api_key)
+            creds = st.session_state.credentials
+
+            def tool_list_properties(): return ga4_mcp_tools.get_account_summaries(creds)
+            def tool_run_report(property_id, dimensions, metrics, start_date="30daysAgo", end_date="today"):
+                return ga4_mcp_tools.run_report(property_id, dimensions, metrics, [{"start_date": start_date, "end_date": end_date}], creds)
+            def tool_get_metadata(property_id): return ga4_mcp_tools.get_property_details(property_id, creds)
+            
+            my_tools = [tool_list_properties, tool_run_report, tool_get_metadata]
+
+            if "current_model" not in st.session_state:
+                st.session_state.current_model = "models/gemini-1.5-flash"
+
+            if st.session_state.get("chat_session") is None:
+                model = genai.GenerativeModel(st.session_state.current_model, tools=my_tools)
+                st.session_state.chat_session = model.start_chat(enable_automatic_function_calling=True)
+
+            # Viewport Messaggi
+            chat_msg_container = st.container(height=420, border=False)
+            with chat_msg_container:
+                if not st.session_state.messages:
+                    st.markdown(f"""
+                    <div class="avatar-container">
+                        <div class="avatar-icon">{header_bot_icon}</div>
+                        <div class="chat-msg-bot">Click on an option to test a use case (or just ask me anything!)</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                for msg in st.session_state.messages:
+                    if msg["role"] == "user":
+                        st.markdown(f"""
+                        <div class="user-message-row">
+                            <div class="chat-msg-user">{msg["content"]}</div>
+                            <div class="user-avatar">👤</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                        <div class="avatar-container">
+                            <div class="avatar-icon">{header_bot_icon}</div>
+                            <div class="chat-msg-bot">{msg["content"]}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+            # Input area
+            if prompt := st.chat_input("Enter your message", key="wr_assistant_input"):
+                st.session_state.messages.append({"role": "user", "content": prompt})
+                with st.spinner(" "):
+                    try:
+                        response = st.session_state.chat_session.send_message(prompt)
+                        st.session_state.messages.append({"role": "assistant", "content": response.text})
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Errore: {e}")
+            
+        except Exception as e:
+            st.error(f"Errore: {e}")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+
 # --- MAIN APP FLOW ---
 if __name__ == "__main__":
     if "credentials" not in st.session_state:
         st.session_state.credentials = None
 
-    # Auto-login check (se esiste token file e non siamo già loggati in sessione)
+    # Scopes setup for profile info
+    if 'https://www.googleapis.com/auth/userinfo.profile' not in SCOPES:
+        SCOPES.append('https://www.googleapis.com/auth/userinfo.profile')
+    if 'https://www.googleapis.com/auth/userinfo.email' not in SCOPES:
+        SCOPES.append('https://www.googleapis.com/auth/userinfo.email')
+
+    # Auto-login check
     base_path = os.path.dirname(os.path.abspath(__file__))
     token_path = os.path.join(base_path, 'token.json')
     
     if st.session_state.credentials is None and os.path.exists(token_path):
-         # Proviamo a caricare le credenziali localmente senza flow interattivo
-         # (do_oauth_flow gestisce già il load da token.json)
          try:
              creds = Credentials.from_authorized_user_file(token_path, SCOPES)
              if creds and creds.valid:
