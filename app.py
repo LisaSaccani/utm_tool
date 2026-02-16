@@ -581,10 +581,7 @@ def show_dashboard():
             with st.expander("📘 Guida ai Canali"):
                 st.table(pd.DataFrame(GUIDE_TABLE_DATA))
 
-            st.markdown("---")
-            st.markdown("### 🤖 WR Assistant")
-            # Render inline chatbot in the right column
-            render_chatbot_interface(st.session_state.credentials, get_persistent_api_key)
+
 
 
     # ==============================================================================
@@ -683,6 +680,9 @@ def show_dashboard():
 
                 except Exception as e:
                     st.error(f"Errore analisi URL: {e}")
+
+    # --- RENDER GLOBALLY (FLOATING) ---
+    render_chatbot_interface(st.session_state.credentials, get_persistent_api_key)
 
 
 # --- MAIN APP FLOW ---

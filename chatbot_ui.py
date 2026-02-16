@@ -257,7 +257,7 @@ def clean_bot_response(text: str) -> str:
             encoded = urlencode(merged, doseq=True, safe="")
             final_url = urlunparse((p.scheme, p.netloc, p.path, p.params, encoded, p.fragment))
             final_url = _rebuild_url_with_encoded_query(final_url)
-            return "Copia e incolla questo link completo:\n" + final_url
+            return "Copia e incolla questo link completo:\\n" + final_url
 
     # Se il testo include un URL, prova a “ripulire” e re-encodare solo quello
     url_in_text = _extract_first_url(text)
@@ -268,9 +268,260 @@ def clean_bot_response(text: str) -> str:
         # Se il bot ha scritto testo + url, mantieni solo l’istruzione + url
         # (per rispettare la richiesta “output solo link”)
         if "utm_" in fixed:
-            return "Copia e incolla questo link completo:\n" + fixed
+            return "Copia e incolla questo link completo:\\n" + fixed
 
     return text
+
+
+# -------------------------
+# Multi-turn context tracking
+# -------------------------
+def _update_context_from_response(raw_response: str, user_input: str, context: dict) -> None:
+    """
+    Best-effort extraction of UTM parameters from Gemini responses and user input.
+    Updates context in place. Never raises.
+    """
+    try:
+        # Reset detection
+        reset_phrases = ["ricominciamo", "nuovo link", "reset", "da capo", "riparti"]
+        if any(phrase in (user_input or "").lower() for phrase in reset_phrases):
+            context["current_step"] = 0
+            for k in context["params"]:
+                context["params"][k] = None
+            context["ga4_property_id"] = None
+            context["tool_cache"] = {}
+            return
+
+        # Extract URL from user input
+        url = _extract_first_url(user_input)
+        if url and not context["params"]["destination_url"]:
+            context["params"]["destination_url"] = _normalize_destination_url(url)
+
+        # Parse JSON blocks from raw response for utm_* keys
+        json_data = _extract_json_block_if_any(raw_response or "")
+        if json_data:
+            for key in ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"]:
+                val = json_data.get(key)
+                if val and str(val).lower() not in ("null", "none", ""):
+                    context["params"][key] = str(val)
+            for url_key in ["url", "URL", "destination_url"]:
+                val = json_data.get(url_key)
+                if val and str(val).strip():
+                    context["params"]["destination_url"] = _normalize_destination_url(str(val))
+
+        # Infer traffic_type from user input
+        if not context["params"]["traffic_type"]:
+            for traffic in ["social", "newsletter", "email", "paid search", "display", "referral"]:
+                if traffic in (user_input or "").lower():
+                    context["params"]["traffic_type"] = traffic
+                    break
+
+        # Infer ga4_channel from user input
+        if not context["params"]["ga4_channel"]:
+            channel_keywords = {
+                "organic social": "Organic Social",
+                "paid social": "Paid Social",
+                "email": "Email",
+                "paid search": "Paid Search",
+                "display": "Display",
+                "referral": "Referral",
+            }
+            for kw, channel in channel_keywords.items():
+                if kw in (user_input or "").lower():
+                    context["params"]["ga4_channel"] = channel
+                    break
+
+        # Extract utm values from user input using common patterns
+        input_lower = (user_input or "").lower()
+        utm_patterns = {
+            "utm_medium": r"(?:utm_?medium|medium)\s*[:=è]\s*([a-z0-9_-]+)",
+            "utm_source": r"(?:utm_?source|source)\s*[:=è]\s*([a-z0-9_-]+)",
+            "utm_campaign": r"(?:utm_?campaign|campaign)\s*[:=è]\s*([a-z0-9_-]+)",
+            "utm_content": r"(?:utm_?content|content)\s*[:=è]\s*([a-z0-9_-]+)",
+            "utm_term": r"(?:utm_?term|term)\s*[:=è]\s*([a-z0-9_-]+)",
+        }
+        for param, pattern in utm_patterns.items():
+            if not context["params"][param]:
+                m = re.search(pattern, input_lower)
+                if m:
+                    context["params"][param] = m.group(1)
+
+        # Advance current_step based on filled params (never goes backward)
+        step_map = [
+            "destination_url",   # step 1
+            "traffic_type",      # step 2
+            "ga4_channel",       # step 3
+            "utm_medium",        # step 4
+            "utm_source",        # step 5
+            "utm_campaign",      # step 6
+        ]
+        filled = 0
+        for param_name in step_map:
+            if context["params"].get(param_name):
+                filled += 1
+            else:
+                break
+        new_step = max(context["current_step"], filled)
+        if filled >= 6:
+            has_optional = context["params"].get("utm_content") or context["params"].get("utm_term")
+            if has_optional:
+                new_step = max(new_step, 7)
+        context["current_step"] = new_step
+
+    except Exception:
+        pass  # Never break the chat
+
+
+def _build_system_instruction(context: dict, current_date: str) -> str:
+    """
+    Builds the system instruction with static rules, skill guidelines,
+    and dynamic conversation state.
+    """
+    def _val(key: str) -> str:
+        v = context["params"].get(key)
+        return v if v else "non ancora fornito"
+
+    step_descriptions = {
+        0: "Chiedi l'URL di destinazione (step 1)",
+        1: "Chiedi il contesto del traffico - social, newsletter, paid search, display, altro (step 2)",
+        2: "Chiedi il canale GA4 target (step 3)",
+        3: "Proponi opzioni per utm_medium (step 4)",
+        4: "Proponi opzioni per utm_source (step 5)",
+        5: "Chiedi utm_campaign nel formato country-lingua_type_name_date (step 6)",
+        6: "Chiedi parametri opzionali utm_content e utm_term (step 7)",
+        7: "Genera il link finale completo (step 8)",
+    }
+    next_step = min(context["current_step"], 7)
+    next_desc = step_descriptions.get(next_step, "Genera il link finale completo (step 8)")
+
+    ga4_val = context.get("ga4_property_id") or "non ancora selezionata"
+
+    base = f"""Sei WR Assistant, un esperto nella generazione di parametri UTM.
+Oggi è il {current_date}.
+
+OBIETTIVO
+Guidare l'utente a creare un URL tracciato che:
+- rispetti le regole UTM definite
+- sia coerente con lo storico GA4 (quando utile)
+- finisca nel canale corretto secondo il channel grouping PRIMARIO della property
+
+REGOLE VISIVE
+1) Solo testo semplice (no HTML, no markdown complesso, no blocchi di codice).
+2) UNA sola domanda per messaggio.
+3) OUTPUT FINALE: stampa SOLO il link completo con un'istruzione del tipo "Copia e incolla questo link completo:".
+   NON stampare JSON, NON usare parentesi graffe.
+
+REGOLE ANTI-RIPETIZIONE
+- Non ripetere i valori dell'utente in modo ridondante.
+- Evita concatenazioni tipo "awarenessawareness".
+
+REGOLE UTM (VALORI)
+- utm_source (mandatory): fonte/origine del traffico
+- utm_medium (mandatory): mezzo/canale attraverso cui arriva il traffico
+- utm_campaign (mandatory): nome della singola campagna
+- utm_term (optional): keyword / caratteristiche della campagna
+- utm_content (optional): differenziare contenuti simili o dettaglio significativo
+Naming convention:
+- Solo lowercase (case-sensitive: "Facebook" != "facebook")
+- No spazi e no caratteri speciali: usare _ o -. Evitare ? % & $ !
+- Coerenza: definire una struttura e seguirla
+- Descrittivo ma conciso
+- Trattini dentro i token per separare parole, underscore tra token
+- Non inventare naming se esiste una convenzione storica.
+
+MAPPING utm_medium / utm_source (DA PROPORRE IN BASE AL traffic_type)
+- Organic: medium=organic, source=google|bing|yahoo|yandex
+- Referral: medium=referral, source=[website domain]
+- Direct: medium=(none), source=(direct)
+- Paid campaign: medium=cpc, source=google|bing
+- Affiliate: medium=affiliate, source=tradetracker
+- Display: medium=cpm, source=reservation|display|programmatic_video
+- Video: medium=cpv, source=youtube
+- Programmatic: medium=cpm, source=rcs|mediamond|rai|ilsole24ore
+- Email/Newsletter: medium=email oppure mailing_campaign, source=newsletter|email|crm
+- Social organic: medium=social_org, source=facebook|instagram|linkedin|...(nome social)
+- Social paid: medium=social_paid, source=facebook|instagram|linkedin|...(nome social)
+- App traffic: medium=(chiedere all'utente), source=app
+- Offline: medium=offline, source=brochure|qr_code|sms
+
+REGOLE utm_campaign (STRUTTURA OBBLIGATORIA)
+Formato: country-lingua_campaignType_campaignName_data[_CTA]
+Token separati da underscore _, parole dentro un token separate da trattino -.
+Token richiesti:
+1) country-lingua: codice paese + lingua (es. it-it, ch-de, es-es)
+2) campaignType: uno tra promo (promotional), ed (editorial), tr (transactional), awr (awareness)
+3) campaignName: nome interno della campagna
+4) data: data invio/riferimento temporale (formato GG-MM-AAAA consigliato)
+Token opzionale:
+5) CTA: es. cta, image, banner
+Golden rules: struttura obbligatoria, token mandatory presenti, _ tra token, - dentro token, no spazi/% /&.
+
+REGOLE utm_term
+- Utile per keyword e caratteristiche specifiche
+- Esempi categorie: nursing, toys, indoor, fashion, toiletries, car-seat, outdoor
+
+VALIDAZIONI DA APPLICARE
+1) Blocca se mancano: utm_source, utm_medium, utm_campaign, base_url
+2) Controlla utm_campaign: token separati da _, minimo 4 token, no spazi/%/&
+3) Forza lowercase su tutti i parametri
+4) Sostituisci spazi con - nei valori
+
+COSTRUZIONE URL
+- Forma: https://www.tuosito.it?utm_source=...&utm_medium=...&utm_campaign=...
+- ? separa URL base e parametri, & unisce i parametri
+- Se base_url contiene già ?, aggiungi UTM con & (non duplicare ?)
+
+REGOLE CANALI GA4
+- Il CANALE dipende dal channel grouping della property.
+- Usa dimensione "sessionPrimaryChannelGroup" (fallback: "sessionDefaultChannelGroup").
+
+REGOLE GA4: QUANDO USARLO
+- Non usare GA4 di default.
+- Usalo quando:
+  a) l'utente chiede verifica/storico (es. "ultimo anno")
+  b) medium/source rischiano di mandare nel canale sbagliato
+  c) servono opzioni coerenti con lo storico
+
+PROPERTY GA4: NON chiedere property_id all'utente
+- Quando hai un URL di destinazione, usa tool_guess_property_from_url(URL) per proporre 1-3 candidate property.
+- Fai UNA domanda: "Ho trovato questa property: X (ID: Y). Confermi?"
+- Se non conferma, proponi le altre candidate (una domanda).
+
+FLOW (UNA DOMANDA PER STEP)
+STEP 1: URL destinazione (normalizza a https://www.)
+STEP 2: Contesto traffico (social, newsletter, paid search, display, altro)
+STEP 3: Canale GA4 target (es. Organic Social / Paid Social / Email / Paid Search / Display / Referral / Direct / Other)
+STEP 4: utm_medium
+- Proponi 2-4 opzioni coerenti col traffic_type (vedi MAPPING sopra)
+- Se possibile, verifica con GA4: dimensions ["sessionPrimaryChannelGroup","sessionMedium"], metric ["sessions"]
+STEP 5: utm_source
+- Proponi 2-4 opzioni coerenti (vedi MAPPING sopra)
+- Se possibile, verifica con GA4: dimensions ["sessionPrimaryChannelGroup","sessionSource"], metric ["sessions"]
+STEP 6: utm_campaign
+- Costruisci chiedendo solo i token mancanti:
+  1) country-lingua, 2) campaignType (mostra opzioni: promo/ed/tr/awr), 3) campaignName, 4) data, 5) CTA (opzionale)
+STEP 7: opzionali (utm_content, poi utm_term)
+STEP 8: output finale SOLO LINK (con query correttamente formattata e senza caratteri speciali nei valori UTM).
+
+STATO ATTUALE DELLA CONVERSAZIONE
+- Step attuale: {next_step} di 8
+- Parametri raccolti:
+  - URL destinazione: {_val("destination_url")}
+  - Tipo di traffico: {_val("traffic_type")}
+  - Canale GA4 target: {_val("ga4_channel")}
+  - utm_medium: {_val("utm_medium")}
+  - utm_source: {_val("utm_source")}
+  - utm_campaign: {_val("utm_campaign")}
+  - utm_content: {_val("utm_content")}
+  - utm_term: {_val("utm_term")}
+- Property GA4: {ga4_val}
+
+ISTRUZIONI BASATE SULLO STATO
+- Non chiedere nuovamente i parametri già raccolti sopra.
+- Il prossimo step da completare è: {next_desc}
+- Se l'utente fornisce più parametri in un solo messaggio, raccoglili tutti e avanza.
+"""
+    return base
 
 
 # -------------------------
@@ -325,8 +576,8 @@ def get_gemini_response_safe(
             continue
 
     raise Exception(
-        "❌ Impossibile trovare un modello Gemini attivo per questa API Key.\n"
-        f"Ultimo errore: {str(last_error)}\n"
+        "❌ Impossibile trovare un modello Gemini attivo per questa API Key.\\n"
+        f"Ultimo errore: {str(last_error)}\\n"
     )
 
 
@@ -335,380 +586,327 @@ def get_gemini_response_safe(
 # -------------------------
 def render_chatbot_interface(creds, api_key_func=None) -> None:
     """
-    Renderizza il widget Chatbot Inline.
+    Renderizza il widget Chatbot in modalità Floating (FAB + Window).
     """
     # Stato
     if "chat_visible" not in st.session_state:
         st.session_state.chat_visible = False
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "utm_context" not in st.session_state:
+        st.session_state.utm_context = {
+            "current_step": 0,
+            "params": {
+                "destination_url": None,
+                "traffic_type": None,
+                "ga4_channel": None,
+                "utm_medium": None,
+                "utm_source": None,
+                "utm_campaign": None,
+                "utm_content": None,
+                "utm_term": None,
+            },
+            "ga4_property_id": None,
+            "tool_cache": {},
+        }
 
-    # CSS
-    st.markdown(
+    # Carica icona
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    icon_path = os.path.join(base_path, "wr_assistant_icon.png.png")
+    icon_b64 = get_base64_image(icon_path)
+    
+    # CSS per Floating Button e Window
+    # Usa selettori molto specifici e un container ID unico per evitare conflitti
+    
+    # 1. STYLE PER IL BUTTON (FAB)
+    # CSS per Floating Button e Window
+    # Usa selettori molto specifici e un container ID unico per evitare conflitti
+    
+    # 1. STYLE PER IL BUTTON (FAB)
+    fab_css = f"""
+        /* Targettiamo SOLO la colonna specifica che contiene il nostro marker univoco */
+        /* Questo evita di matchare il main container o blocchi generici che contengono altri bottoni */
+        div[data-testid="stColumn"]:has(div.fab-unique-marker) {{
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            width: auto !important;
+            height: auto !important;
+            z-index: 999999;
+            background: transparent !important;
+            pointer-events: none;
+            overflow: visible !important; /* Importante per far uscire il fixed */
+        }}
+        
+        div[data-testid="stColumn"]:has(div.fab-unique-marker) button {{
+            pointer-events: auto;
+            width: 70px !important;
+            height: 70px !important;
+            border-radius: 50% !important;
+            border: none !important;
+            box-shadow: 0 6px 16px rgba(0,0,0,0.2) !important;
+            transition: transform 0.2s, box-shadow 0.2s !important;
+            background-color: white !important;
+            background-size: cover !important;
+            background-position: center !important;
+            background-repeat: no-repeat !important;
+            display: block !important;
+            margin: 0 !important;
+        }}
+        
+        div[data-testid="stColumn"]:has(div.fab-unique-marker) button:hover {{
+            transform: scale(1.05);
+            box-shadow: 0 8px 20px rgba(0,0,0,0.3) !important;
+        }}
+        
+        div[data-testid="stColumn"]:has(div.fab-unique-marker) button p {{
+            display: none !important;
+        }}
+        
+        /* Nasconde il marker stesso */
+        .fab-unique-marker {{
+            display: none;
+        }}
+    """
+    
+    if icon_b64:
+        fab_css += f"""
+        div[data-testid="stColumn"]:has(div.fab-unique-marker) button {{
+            background-image: url("data:image/png;base64,{icon_b64}") !important;
+        }}
         """
-        <style>
-            .inline-chat-container {
-                background: white;
-                border-radius: 12px;
-                box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-                border: 1px solid #e5e7eb;
-                overflow: hidden;
-                font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-                height: 100%;
-                display: flex;
-                flex-direction: column;
-            }
-            .inline-chat-header {
-                background: #2563eb;
-                color: white;
-                padding: 14px 18px;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                font-weight: 600;
-                font-size: 16px;
-            }
-            .inline-chat-header-title { display: flex; align-items: center; gap: 8px; }
-            .inline-message-bubble { display: flex; margin-bottom: 12px; }
-            .inline-bubble-content {
-                padding: 10px 14px;
-                border-radius: 12px;
-                font-size: 14px;
-                line-height: 1.5;
-                max-width: 85%;
-                white-space: pre-wrap;
-                word-break: break-word;
-            }
-            .inline-user-bubble {
-                background: #2563eb;
-                color: white;
-                border-bottom-right-radius: 3px;
-                margin-left: auto;
-            }
-            .inline-model-bubble {
-                background: #f3f4f6;
-                color: #374151;
-                border: 1px solid #e5e7eb;
-                border-bottom-left-radius: 3px;
-                margin-right: auto;
-            }
-            .inline-welcome-message {
-                background: #eff6ff;
-                color: #1e40af;
-                padding: 16px;
-                border-radius: 8px;
-                text-align: center;
-                margin: 20px;
-                border: 1px solid #dbeafe;
-            }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    else:
+        fab_css += """
+        div[data-testid="stColumn"]:has(div.fab-unique-marker) button {
+            background-color: #2563eb !important;
+        }
+        div[data-testid="stColumn"]:has(div.fab-unique-marker) button::after {
+            content: "💬";
+            font-size: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: white;
+        }
+        """
 
-    # Bottone apertura
-    if not st.session_state.chat_visible:
-        if st.button("🤖 Apri WR Assistant", key="open_chat_btn", use_container_width=True):
-            st.session_state.chat_visible = True
+    # 2. STYLE PER LA WINDOW
+    window_css = """
+        div[data-testid="stVerticalBlock"]:has(span.window-marker) {
+            position: fixed;
+            bottom: 110px;
+            right: 30px;
+            width: 380px !important;
+            max-width: 90vw;
+            height: 600px !important;
+            max-height: 80vh;
+            background-color: white;
+            border-radius: 16px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.15);
+            z-index: 999998;
+            border: 1px solid #e5e7eb;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            padding: 0 !important;
+            gap: 0 !important;
+        }
+        
+        .chat-header {
+            background: #2563eb;
+            color: white;
+            padding: 16px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-weight: 600;
+            font-size: 16px;
+            border-bottom: 1px solid #1d4ed8;
+            flex-shrink: 0; 
+        }
+        
+        .msg-bubble { 
+            padding: 12px 16px; 
+            border-radius: 12px; 
+            font-size: 14px; 
+            line-height: 1.5; 
+            max-width: 85%;
+            word-wrap: break-word;
+        }
+        .msg-user { 
+            background: #2563eb; 
+            color: white; 
+            align-self: flex-end; 
+            border-bottom-right-radius: 2px;
+        }
+        .msg-bot { 
+            background: white; 
+            color: #1f2937; 
+            border: 1px solid #e5e7eb; 
+            align-self: flex-start;
+            border-bottom-left-radius: 2px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+        }
+    """
+
+    st.markdown(f"<style>{fab_css}{window_css}</style>", unsafe_allow_html=True)
+
+    # 1. FLOATING BUTTON CONTAINER
+    # Usiamo una colonna isolata (st.columns crea un wrapper specifico diverso dal main flow)
+    # Questo ci permette di targettare div[data-testid="stColumn"] ed evitare collisioni con i bottoni nel main flow
+    c_fab = st.columns([1])[0]
+    with c_fab:
+        st.markdown('<div class="fab-unique-marker">marker</div>', unsafe_allow_html=True)
+        if st.button("WR", key="fab_main_toggle"):
+            st.session_state.chat_visible = not st.session_state.chat_visible
             st.rerun()
-        return
 
-    # Container
-    st.markdown('<div class="inline-chat-container">', unsafe_allow_html=True)
-
-    # Header
-    col_header, col_close = st.columns([0.85, 0.15])
-    with col_header:
-        st.markdown(
-            """
-            <div class="inline-chat-header">
-                <div class="inline-chat-header-title">
-                    <span>🤖 WR Assistant</span>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with col_close:
-        if st.button("✕", key="close_chat_btn", help="Chiudi chat"):
-            st.session_state.chat_visible = False
-            st.rerun()
-
-    # Messaggi
-    messages_container = st.container(height=450)
-    with messages_container:
-        if not st.session_state.messages:
-            st.markdown(
-                """
-                <div class="inline-welcome-message">
-                    <b>WR Assistant</b><br><br>
-                    Posso aiutarti a generare link UTM corretti seguendo le best practice aziendali.<br>
-                    Scrivi <i>"crea un nuovo link"</i> o incolla un URL per iniziare.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        else:
-            for msg in st.session_state.messages:
-                if msg["role"] == "user":
-                    st.markdown(
-                        f"""
-                        <div class="inline-message-bubble">
-                            <div class="inline-bubble-content inline-user-bubble">
-                                {msg["content"]}
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.markdown(
-                        f"""
-                        <div class="inline-message-bubble">
-                            <div class="inline-bubble-content inline-model-bubble">
-                                {msg["content"]}
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-    # Input
-    with st.form("inline_chat_form", clear_on_submit=True):
-        col_input, col_send = st.columns([0.85, 0.15])
-        with col_input:
-            user_input = st.text_input(
-                "Message",
-                label_visibility="collapsed",
-                placeholder="Scrivi qui il tuo messaggio...",
-            )
-        with col_send:
-            sent = st.form_submit_button("➤", use_container_width=True)
-
-        if sent and user_input:
-            st.session_state.messages.append({"role": "user", "content": user_input})
-
-            try:
-                api_key = st.session_state.get("gemini_api_key")
-                if not api_key:
-                    st.session_state.messages.append(
-                        {
-                            "role": "assistant",
-                            "content": "⚠️ API Key non configurata.\nConfigura la Gemini API Key nelle impostazioni.",
-                        }
-                    )
+    # 2. CHAT WINDOW CONTAINER
+    if st.session_state.chat_visible:
+        with st.container():
+            st.markdown('<span class="window-marker" style="display:none;"></span>', unsafe_allow_html=True)
+            
+            # HEADER
+            c_h1, c_h2 = st.columns([0.85, 0.15])
+            with c_h1:
+                st.markdown('<div style="font-weight:600; color:#1f2937; margin-top:5px; margin-left:5px;">🤖 WR Assistant</div>', unsafe_allow_html=True)
+            with c_h2:
+                if st.button("✕", key="close_window_btn"):
+                    st.session_state.chat_visible = False
                     st.rerun()
+                    
+            st.markdown('<div style="height:1px; background:#e5e7eb; margin: 10px 0;"></div>', unsafe_allow_html=True)
 
-                genai.configure(api_key=api_key)
-
-                # -------------------------
-                # Tools (GA4)
-                # -------------------------
-                def tool_list_properties() -> Any:
-                    """Lista le property GA4 disponibili nell'account autenticato."""
-                    return ga4_mcp_tools.get_account_summaries(creds)
-
-                def tool_get_metadata(property_id: str) -> Any:
-                    """Recupera dettagli/metadati della property GA4."""
-                    return ga4_mcp_tools.get_property_details(property_id, creds)
-
-                def tool_run_report(
-                    property_id: str,
-                    dimensions: List[str],
-                    metrics: List[str],
-                    start_date: str = "30daysAgo",
-                    end_date: str = "today",
-                ) -> Any:
-                    """
-                    Esegue un report GA4.
-                    """
-                    return ga4_mcp_tools.run_report(
-                        property_id,
-                        dimensions,
-                        metrics,
-                        [{"start_date": start_date, "end_date": end_date}],
-                        creds,
-                    )
-
-                def tool_run_realtime_report(
-                    property_id: str,
-                    dimensions: List[str],
-                    metrics: List[str]
-                ) -> Any:
-                    """Esegue un realtime report GA4."""
-                    return ga4_mcp_tools.run_realtime_report(property_id, dimensions, metrics, creds)
-
-                def tool_list_ads_links(property_id: str) -> Any:
-                    """Lista i link Google Ads collegati alla property GA4."""
-                    return ga4_mcp_tools.list_google_ads_links(property_id, creds)
-
-                def tool_guess_property_from_url(destination_url: str) -> Dict[str, Any]:
-                    """
-                    Prova a indovinare la property GA4 a partire dall'URL di destinazione:
-                    - lista le property
-                    - fa matching sul dominio vs displayName (heuristic)
-                    Ritorna una lista di candidati con punteggio.
-                    """
-                    url = _normalize_destination_url(destination_url)
-                    host = urlparse(url).netloc.lower().replace("www.", "")
-                    host_root = host.split(":")[0]
-
-                    summaries = ga4_mcp_tools.get_account_summaries(creds)
-
-                    # estrazione robusta: dipende da come ga4_mcp_tools serializza i summary
-                    props = []
-                    if isinstance(summaries, dict):
-                        # prova chiavi comuni
-                        for k in ["propertySummaries", "properties", "items", "data"]:
-                            if k in summaries and isinstance(summaries[k], list):
-                                props = summaries[k]
-                                break
-                        if not props and "accountSummaries" in summaries and isinstance(summaries["accountSummaries"], list):
-                            # GA4 Admin API spesso ritorna accountSummaries -> propertySummaries
-                            for acc in summaries["accountSummaries"]:
-                                ps = acc.get("propertySummaries") or []
-                                if isinstance(ps, list):
-                                    props.extend(ps)
-                    elif isinstance(summaries, list):
-                        # lista di accountSummaries
-                        for acc in summaries:
-                            ps = acc.get("propertySummaries") or []
-                            if isinstance(ps, list):
-                                props.extend(ps)
-
-                    candidates = []
-                    for p in props:
-                        display = (p.get("displayName") or p.get("name") or "").lower()
-                        name = p.get("name") or ""  # spesso "properties/123"
-                        pid = ""
-                        m = re.search(r"properties/(\d+)", name)
-                        if m:
-                            pid = m.group(1)
-
-                        score = 0
-                        if host_root and host_root in display:
-                            score += 3
-                        # match su token (es. chicco)
-                        token = host_root.split(".")[0] if host_root else ""
-                        if token and token in display:
-                            score += 2
-                        if token and token in (p.get("displayName") or "").lower():
-                            score += 1
-
-                        candidates.append(
-                            {
-                                "property_id": pid,
-                                "display_name": p.get("displayName") or "",
-                                "score": score,
-                            }
-                        )
-
-                    candidates.sort(key=lambda x: x["score"], reverse=True)
-                    top = candidates[:5]
-
-                    # Se tutte score 0, comunque ritorna top 5 per conferma manuale
-                    return {
-                        "normalized_url": url,
-                        "domain": host_root,
-                        "candidates": top,
-                        "note": "Heuristic match su domain/displayName; conferma richiesta all'utente.",
-                    }
-
-                my_tools = [
-                    tool_list_properties,
-                    tool_get_metadata,
-                    tool_run_report,
-                    tool_run_realtime_report,
-                    tool_list_ads_links,
-                    tool_guess_property_from_url,
-                ]
-
-                # -------------------------
-                # System instruction (aggiornata)
-                # -------------------------
-                current_date = datetime.now().strftime("%Y-%m-%d")
-
-                system_instruction = f"""
-Sei WR Assistant, un esperto nella generazione di parametri UTM.
-Oggi è il {current_date}.
-
-OBIETTIVO
-Guidare l'utente a creare un URL tracciato che:
-- rispetti le regole UTM definite
-- sia coerente con lo storico GA4 (quando utile)
-- finisca nel canale corretto secondo il channel grouping PRIMARIO della property
-
-REGOLE VISIVE
-1) Solo testo semplice (no HTML, no markdown complesso, no blocchi di codice).
-2) UNA sola domanda per messaggio.
-3) OUTPUT FINALE: stampa SOLO il link completo con un’istruzione del tipo "Copia e incolla questo link completo:".
-   NON stampare JSON, NON usare parentesi graffe.
-
-REGOLE ANTI-RIPETIZIONE
-- Non ripetere i valori dell'utente in modo ridondante.
-- Evita concatenazioni tipo "awarenessawareness".
-
-REGOLE UTM (VALORI)
-- utm_source / utm_medium / utm_campaign / utm_content / utm_term:
-  - lowercase
-  - senza spazi (usa underscore)
-  - evita caratteri speciali: usa solo a-z 0-9 _ -
-- Non inventare naming se esiste una convenzione storica.
-
-REGOLE CANALI GA4
-- Il CANALE dipende dal channel grouping della property.
-- Usa dimensione "sessionPrimaryChannelGroup" (fallback: "sessionDefaultChannelGroup").
-
-REGOLE GA4: QUANDO USARLO
-- Non usare GA4 di default.
-- Usalo quando:
-  a) l’utente chiede verifica/storico (es. "ultimo anno")
-  b) medium/source rischiano di mandare nel canale sbagliato
-  c) servono opzioni coerenti con lo storico
-
-PROPERTY GA4: NON chiedere property_id all’utente
-- Quando hai un URL di destinazione, usa tool_guess_property_from_url(URL) per proporre 1-3 candidate property.
-- Fai UNA domanda: "Ho trovato questa property: X (ID: Y). Confermi?"
-- Se non conferma, proponi le altre candidate (una domanda).
-
-FLOW (UNA DOMANDA PER STEP)
-STEP 1: URL destinazione (normalizza a https://www.)
-STEP 2: Contesto traffico (social, newsletter, paid search, display, altro)
-STEP 3: Canale GA4 target (es. Organic Social / Paid Social / Email / Paid Search / Display / Referral / Direct / Other)
-STEP 4: utm_medium
-- Proponi 2-4 opzioni (meglio se da GA4 nel canale target):
-  report: dimensions ["sessionPrimaryChannelGroup","sessionMedium"], metric ["sessions"]
-STEP 5: utm_source
-- Proponi 2-4 opzioni coerenti (meglio se da GA4 nel canale target):
-  report: dimensions ["sessionPrimaryChannelGroup","sessionSource"], metric ["sessions"]
-STEP 6: utm_campaign
-Formato: market_type_name_date
-- market: scegliere O country (es. IT) O lingua (es. it) — non entrambi
-- date: formato GG-MM-AAAA (se l’utente inserisce altro formato, chiedi conferma conversione)
-STEP 7: opzionali (utm_content, poi utm_term)
-STEP 8: output finale SOLO LINK (con query correttamente formattata e senza caratteri speciali nei valori UTM).
-"""
-
-                # history
-                history: List[Dict[str, Any]] = []
+            # MESSAGES
+            msg_container = st.container(height=450, border=False)
+            with msg_container:
+                if not st.session_state.messages:
+                    if icon_b64:
+                        img_html = f'<img src="data:image/png;base64,{icon_b64}" style="width:60px; height:60px; margin-bottom:15px; opacity:0.8; border-radius:50%;">'
+                    else:
+                        img_html = ''
+                    st.markdown(f"""
+                        <div style="text-align:center; padding:30px 20px; color:#6b7280; font-size:14px;">
+                            {img_html}
+                            <br>
+                            <b>Ciao!</b><br>
+                            Sono qui per aiutarti coi parametri UTM.
+                        </div>
+                    """, unsafe_allow_html=True)
+                
                 for msg in st.session_state.messages:
-                    role = "user" if msg["role"] == "user" else "model"
-                    history.append({"role": role, "parts": [msg["content"]]})
+                    if msg["role"] == "user":
+                        st.markdown(f'<div style="display:flex; justify-content:flex-end;"><div class="msg-bubble msg-user">{msg["content"]}</div></div>', unsafe_allow_html=True)
+                    else:
+                        st.markdown(f'<div style="display:flex; justify-content:flex-start;"><div class="msg-bubble msg-bot">{msg["content"]}</div></div>', unsafe_allow_html=True)
 
-                response_text, _used_model = get_gemini_response_safe(
-                    user_input=user_input,
-                    history=history,
-                    tools=my_tools,
-                    system_instruction=system_instruction,
-                    api_key=api_key,
-                )
+            # INPUT
+            with st.form("chat_input_form", clear_on_submit=True):
+                user_text = st.text_input("Messaggio", label_visibility="collapsed", placeholder="Scrivi qui...")
+                submitted = st.form_submit_button("Invia ➤", use_container_width=True)
+                
+                if submitted and user_text:
+                    st.session_state.messages.append({"role": "user", "content": user_text})
+                    
+                    try:
+                        api_key = st.session_state.get("gemini_api_key")
+                        if not api_key:
+                            st.session_state.messages.append({"role": "assistant", "content": "⚠️ Configura prima la API Key nelle impostazioni."})
+                            st.rerun()
+                            
+                        genai.configure(api_key=api_key)
+                        utm_ctx = st.session_state.utm_context
 
-                cleaned = clean_bot_response(response_text)
-                st.session_state.messages.append({"role": "assistant", "content": cleaned})
+                        # --- TOOLS ---
+                        def tool_list_properties() -> Any:
+                            cache_key = "list_properties"
+                            if cache_key in utm_ctx["tool_cache"]:
+                                return utm_ctx["tool_cache"][cache_key]
+                            result = ga4_mcp_tools.get_account_summaries(creds)
+                            utm_ctx["tool_cache"][cache_key] = result
+                            return result
 
-            except Exception as e:
-                st.session_state.messages.append({"role": "assistant", "content": f"❌ Errore: {str(e)}"})
+                        def tool_get_metadata(property_id: str) -> Any:
+                            return ga4_mcp_tools.get_property_details(property_id, creds)
 
-            st.rerun()
+                        def tool_run_report(property_id: str, dimensions: List[str], metrics: List[str], start_date: str = "30daysAgo", end_date: str = "today") -> Any:
+                            cache_key = f"run_report:{property_id}:{dimensions}:{metrics}:{start_date}:{end_date}"
+                            if cache_key in utm_ctx["tool_cache"]:
+                                return utm_ctx["tool_cache"][cache_key]
+                            result = ga4_mcp_tools.run_report(property_id, dimensions, metrics, [{"start_date": start_date, "end_date": end_date}], creds)
+                            utm_ctx["tool_cache"][cache_key] = result
+                            return result
 
-    st.markdown("</div>", unsafe_allow_html=True)
+                        def tool_run_realtime_report(property_id: str, dimensions: List[str], metrics: List[str]) -> Any:
+                            return ga4_mcp_tools.run_realtime_report(property_id, dimensions, metrics, creds)
+
+                        def tool_list_ads_links(property_id: str) -> Any:
+                            return ga4_mcp_tools.list_google_ads_links(property_id, creds)
+
+                        def tool_guess_property_from_url(destination_url: str) -> Dict[str, Any]:
+                            cache_key = f"guess_property:{destination_url}"
+                            if cache_key in utm_ctx["tool_cache"]:
+                                return utm_ctx["tool_cache"][cache_key]
+                            url = _normalize_destination_url(destination_url)
+                            host = urlparse(url).netloc.lower().replace("www.", "")
+                            host_root = host.split(":")[0]
+                            summaries = ga4_mcp_tools.get_account_summaries(creds)
+                            props = []
+                            if isinstance(summaries, dict):
+                                for k in ["propertySummaries", "properties", "items", "data"]:
+                                    if k in summaries and isinstance(summaries[k], list):
+                                        props = summaries[k]; break
+                                if not props and "accountSummaries" in summaries:
+                                    for acc in summaries["accountSummaries"]:
+                                        ps = acc.get("propertySummaries") or []
+                                        if isinstance(ps, list): props.extend(ps)
+                            elif isinstance(summaries, list):
+                                for acc in summaries:
+                                    ps = acc.get("propertySummaries") or []
+                                    if isinstance(ps, list): props.extend(ps)
+                            candidates = []
+                            for p in props:
+                                display = (p.get("displayName") or p.get("name") or "").lower()
+                                pid = ""
+                                m = re.search(r"properties/(\d+)", p.get("name") or "")
+                                if m: pid = m.group(1)
+                                score = 0
+                                if host_root and host_root in display: score += 3
+                                candidates.append({"property_id": pid, "display_name": p.get("displayName"), "score": score})
+                            candidates.sort(key=lambda x: x["score"], reverse=True)
+                            result = {"candidates": candidates[:5], "domain": host_root}
+                            utm_ctx["tool_cache"][cache_key] = result
+                            return result
+
+                        my_tools = [tool_list_properties, tool_get_metadata, tool_run_report, tool_run_realtime_report, tool_list_ads_links, tool_guess_property_from_url]
+
+                        # --- Dynamic system instruction ---
+                        current_date = datetime.now().strftime("%Y-%m-%d")
+                        system_instruction = _build_system_instruction(utm_ctx, current_date)
+
+                        # --- History ---
+                        history = []
+                        for msg in st.session_state.messages:
+                            if msg == st.session_state.messages[-1]: continue
+                            role = "user" if msg["role"] == "user" else "model"
+                            text = msg.get("raw_content", msg["content"])
+                            history.append({"role": role, "parts": [text]})
+
+                        response_text, _ = get_gemini_response_safe(user_text, history, my_tools, system_instruction, api_key)
+                        cleaned = clean_bot_response(response_text)
+                        
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": cleaned,
+                            "raw_content": response_text,
+                        })
+
+                        # Update conversation context
+                        _update_context_from_response(response_text, user_text, utm_ctx)
+
+                        st.rerun()
+
+                    except Exception as e:
+                        st.session_state.messages.append({"role": "assistant", "content": f"❌ Errore: {str(e)}"})
+                        st.rerun()
