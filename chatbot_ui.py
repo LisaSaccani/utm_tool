@@ -60,17 +60,20 @@ def _extract_first_url(text: str) -> Optional[str]:
     # 1) URL completi
     m = re.search(r"(https?://[^\s]+)", text)
     if m:
-        return m.group(1).strip()
+        url = m.group(1).strip()
+        return re.sub(r"[`\"'.,;:)\]]+$", "", url)
 
     # 2) URL tipo www.sito.it/...
     m = re.search(r"\b(www\.[^\s]+)\b", text)
     if m:
-        return m.group(1).strip()
+        url = m.group(1).strip()
+        return re.sub(r"[`\"'.,;:)\]]+$", "", url)
 
     # 3) URL tipo dominio.tld/...
     m = re.search(r"\b([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(/[^\s]*)?\b", text)
     if m:
-        return (m.group(1) + (m.group(2) or "")).strip()
+        url = (m.group(1) + (m.group(2) or "")).strip()
+        return re.sub(r"[`\"'.,;:)\]]+$", "", url)
 
     return None
 
@@ -147,11 +150,12 @@ def _sanitize_utm_value(value: str) -> str:
 
 def _try_fix_date_to_ddmmyyyy(date_str: str) -> Optional[str]:
     """
-    Accetta input comuni e restituisce data in formato GG-MM-AAAA.
+    Accetta input comuni e restituisce data in formato GGMMAAAA.
     Esempi supportati:
-    - 2026-02-10 -> 10-02-2026
-    - 10.02.26 -> 10-02-2026
-    - 10/02/2026 -> 10-02-2026
+    - 2026-02-10 -> 10022026
+    - 10.02.26 -> 10022026
+    - 10/02/2026 -> 10022026
+    - 10-02-2026 -> 10022026
     """
     if not date_str:
         return None
@@ -162,7 +166,7 @@ def _try_fix_date_to_ddmmyyyy(date_str: str) -> Optional[str]:
     m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s)
     if m:
         yyyy, mm, dd = m.group(1), m.group(2), m.group(3)
-        return f"{dd}-{mm}-{yyyy}"
+        return f"{dd}{mm}{yyyy}"
 
     # DD.MM.YY or DD.MM.YYYY
     m = re.match(r"^(\d{2})\.(\d{2})\.(\d{2,4})$", s)
@@ -170,15 +174,38 @@ def _try_fix_date_to_ddmmyyyy(date_str: str) -> Optional[str]:
         dd, mm, yy = m.group(1), m.group(2), m.group(3)
         if len(yy) == 2:
             yy = "20" + yy
-        return f"{dd}-{mm}-{yy}"
+        return f"{dd}{mm}{yy}"
 
     # DD/MM/YYYY
     m = re.match(r"^(\d{2})/(\d{2})/(\d{4})$", s)
     if m:
         dd, mm, yyyy = m.group(1), m.group(2), m.group(3)
-        return f"{dd}-{mm}-{yyyy}"
+        return f"{dd}{mm}{yyyy}"
+
+    # DD-MM-YYYY
+    m = re.match(r"^(\d{2})-(\d{2})-(\d{4})$", s)
+    if m:
+        dd, mm, yyyy = m.group(1), m.group(2), m.group(3)
+        return f"{dd}{mm}{yyyy}"
 
     return None
+
+
+def _normalize_utm_campaign_date_token(utm_campaign: str) -> str:
+    """
+    Normalizza la componente data dentro utm_campaign al formato GGMMAAAA.
+    Esempio: it_awr_saldi_27-02-2026_cta -> it_awr_saldi_27022026_cta
+    """
+    value = (utm_campaign or "").strip().replace("`", "")
+    if not value:
+        return value
+    parts = value.split("_")
+    for i, part in enumerate(parts):
+        fixed = _try_fix_date_to_ddmmyyyy(part)
+        if fixed:
+            parts[i] = fixed
+            break
+    return "_".join(parts)
 
 
 def _rebuild_url_with_encoded_query(url: str) -> str:
@@ -232,6 +259,12 @@ def clean_bot_response(text: str) -> str:
 
     # rimuove backticks
     text = text.replace("```json", "").replace("```", "")
+    text = text.replace("`", "")
+    # rimuove escape markdown superflui (es. social\_paid -> social_paid)
+    text = text.replace("\\_", "_")
+    text = text.replace("\\[", "[").replace("\\]", "]")
+    # guard-rail su artefatti multilingua occasionali
+    text = text.replace("দেশ/lingua", "country/lingua")
 
     # dedupe
     text = _dedupe_repetitions(text).strip()
@@ -248,7 +281,10 @@ def clean_bot_response(text: str) -> str:
             v = parsed_json.get(k)
             if v is None or v == "" or str(v).lower() == "null":
                 continue
-            utm_pairs.append((k, str(v)))
+            clean_v = str(v).replace("`", "").strip()
+            if k == "utm_campaign":
+                clean_v = _normalize_utm_campaign_date_token(clean_v)
+            utm_pairs.append((k, clean_v))
 
         if base_url:
             p = urlparse(base_url)
@@ -263,7 +299,17 @@ def clean_bot_response(text: str) -> str:
     url_in_text = _extract_first_url(text)
     if url_in_text:
         norm = _normalize_destination_url(url_in_text)
-        fixed = _rebuild_url_with_encoded_query(norm)
+        p = urlparse(norm)
+        pairs = parse_qsl(p.query, keep_blank_values=True)
+        cleaned_pairs = []
+        for key, value in pairs:
+            clean_value = (value or "").replace("`", "").strip()
+            if key == "utm_campaign":
+                clean_value = _normalize_utm_campaign_date_token(clean_value)
+            cleaned_pairs.append((key, clean_value))
+        encoded = urlencode(cleaned_pairs, doseq=True, safe="")
+        fixed = urlunparse((p.scheme, p.netloc, p.path, p.params, encoded, p.fragment))
+        fixed = _rebuild_url_with_encoded_query(fixed)
 
         # Se il bot ha scritto testo + url, mantieni solo l’istruzione + url
         # (per rispettare la richiesta “output solo link”)
@@ -316,7 +362,21 @@ def _update_context_from_response(raw_response: str, user_input: str, context: d
                     context["params"]["traffic_type"] = traffic
                     break
 
-        # Infer ga4_channel from user input
+        # If traffic_type is known, prefill GA4 channel to avoid redundant questions
+        if context["params"]["traffic_type"] and not context["params"]["ga4_channel"]:
+            tt = context["params"]["traffic_type"].lower()
+            traffic_to_channel = {
+                "social": "Paid Social",
+                "newsletter": "Email",
+                "email": "Email",
+                "paid search": "Paid Search",
+                "display": "Display",
+                "referral": "Referral",
+            }
+            if tt in traffic_to_channel:
+                context["params"]["ga4_channel"] = traffic_to_channel[tt]
+
+        # Infer ga4_channel from user input (fallback only if still missing)
         if not context["params"]["ga4_channel"]:
             channel_keywords = {
                 "organic social": "Organic Social",
@@ -383,13 +443,13 @@ def _build_system_instruction(context: dict, current_date: str) -> str:
 
     step_descriptions = {
         0: "Chiedi l'URL di destinazione (step 1)",
-        1: "Chiedi il contesto del traffico - social, newsletter, paid search, display, altro (step 2)",
-        2: "Chiedi il canale GA4 target (step 3)",
-        3: "Proponi opzioni per utm_medium (step 4)",
-        4: "Proponi opzioni per utm_source (step 5)",
-        5: "Chiedi utm_campaign nel formato country-lingua_type_name_date (step 6)",
-        6: "Chiedi parametri opzionali utm_content e utm_term (step 7)",
-        7: "Genera il link finale completo (step 8)",
+        1: "Chiedi il contesto traffico SOLO se non già noto (social/newsletter/paid search/display/altro)",
+        2: "Se il contesto è già chiaro, NON chiedere il canale: usa quello coerente",
+        3: "Proponi opzioni per utm_medium coerenti con quanto già detto",
+        4: "Proponi opzioni per utm_source coerenti con quanto già detto",
+        5: "Chiedi utm_campaign nel formato country-lingua_type_name_date",
+        6: "Chiedi parametri opzionali utm_content e utm_term",
+        7: "Genera il link finale completo",
     }
     next_step = min(context["current_step"], 7)
     next_desc = step_descriptions.get(next_step, "Genera il link finale completo (step 8)")
@@ -410,6 +470,8 @@ REGOLE VISIVE
 2) UNA sola domanda per messaggio.
 3) OUTPUT FINALE: stampa SOLO il link completo con un'istruzione del tipo "Copia e incolla questo link completo:".
    NON stampare JSON, NON usare parentesi graffe.
+4) Rispondi esclusivamente in italiano corretto.
+5) Non usare parole o caratteri di altre lingue/scritture.
 
 REGOLE ANTI-RIPETIZIONE
 - Non ripetere i valori dell'utente in modo ridondante.
@@ -444,14 +506,14 @@ MAPPING utm_medium / utm_source (DA PROPORRE IN BASE AL traffic_type)
 - App traffic: medium=(chiedere all'utente), source=app
 - Offline: medium=offline, source=brochure|qr_code|sms
 
-REGOLE utm_campaign (STRUTTURA OBBLIGATORIA)
+ REGOLE utm_campaign (STRUTTURA OBBLIGATORIA)
 Formato: country-lingua_campaignType_campaignName_data[_CTA]
 Token separati da underscore _, parole dentro un token separate da trattino -.
 Token richiesti:
 1) country-lingua: indica la provenienza/lingua della campagna. È sufficiente inserire UNO dei due: solo il paese (es. it, ch, es) OPPURE paese-lingua (es. it-it, ch-de, es-es). Non è obbligatorio fornire entrambi. Esempi validi: "it", "ch", "it-it", "ch-de".
-2) campaignType: uno tra promo (promotional), ed (editorial), tr (transactional), awr (awareness)
+2) campaignType: preferibilmente promo (promotional), ed (editorial), tr (transactional), awr (awareness); sono consentiti anche nuovi tipi personalizzati
 3) campaignName: nome interno della campagna
-4) data: data invio/riferimento temporale (formato GG-MM-AAAA consigliato)
+4) data: data invio/riferimento temporale (formato GGMMAAAA, senza separatori)
 Token opzionale:
 5) CTA: es. cta, image, banner
 Golden rules: struttura obbligatoria, token mandatory presenti, _ tra token, - dentro token, no spazi/% /&.
@@ -489,15 +551,15 @@ GESTIONE ERRORI GA4
 - Se GA4 non è disponibile, continua comunque il flusso UTM usando le regole statiche e i mapping definiti sopra.
 - Non bloccare il flusso UTM a causa di errori GA4: prosegui e proponi opzioni basate sulle regole.
 
-PROPERTY GA4: NON chiedere property_id all'utente
-- Quando hai un URL di destinazione, usa tool_guess_property_from_url(URL) per proporre 1-3 candidate property.
-- Fai UNA domanda: "Ho trovato questa property: X (ID: Y). Confermi?"
-- Se non conferma, proponi le altre candidate (una domanda).
+PROPERTY GA4: AUTO-SELEZIONE SENZA CONFERMA
+- Quando hai un URL di destinazione, usa tool_guess_property_from_url(URL) e seleziona automaticamente la migliore candidata (score più alto).
+- NON chiedere conferma della property all'utente.
+- Se non trovi candidate affidabili, continua con regole statiche senza bloccare il flusso.
 
-FLOW (UNA DOMANDA PER STEP)
+FLOW (UNA DOMANDA PER STEP, ADATTIVO)
 STEP 1: URL destinazione (normalizza a https://www.)
-STEP 2: Contesto traffico (social, newsletter, paid search, display, altro)
-STEP 3: Canale GA4 target (es. Organic Social / Paid Social / Email / Paid Search / Display / Referral / Direct / Other)
+STEP 2: Contesto traffico (social, newsletter, paid search, display, altro) SOLO se non già noto
+STEP 3: Canale GA4 target SOLO se indispensabile e non deducibile dal contesto
 STEP 4: utm_medium
 - Proponi 2-4 opzioni coerenti col traffic_type (vedi MAPPING sopra)
 - Se possibile, verifica con GA4: dimensions ["sessionPrimaryChannelGroup","sessionMedium"], metric ["sessions"]
@@ -506,7 +568,7 @@ STEP 5: utm_source
 - Se possibile, verifica con GA4: dimensions ["sessionPrimaryChannelGroup","sessionSource"], metric ["sessions"]
 STEP 6: utm_campaign
 - Costruisci chiedendo solo i token mancanti:
-  1) country-lingua, 2) campaignType (mostra opzioni: promo/ed/tr/awr), 3) campaignName, 4) data, 5) CTA (opzionale)
+  1) country-lingua, 2) campaignType (suggerisci promo/ed/tr/awr ma accetta anche nuovi tipi personalizzati), 3) campaignName, 4) data, 5) CTA (opzionale)
 STEP 7: opzionali (utm_content, poi utm_term)
 STEP 8: output finale SOLO LINK (con query correttamente formattata e senza caratteri speciali nei valori UTM).
 
@@ -527,6 +589,7 @@ ISTRUZIONI BASATE SULLO STATO
 - Non chiedere nuovamente i parametri già raccolti sopra.
 - Il prossimo step da completare è: {next_desc}
 - Se l'utente fornisce più parametri in un solo messaggio, raccoglili tutti e avanza.
+- Se l'utente dice "campagna social", NON chiedere se è email/display: proponi direttamente opzioni social coerenti.
 """
     return base
 
@@ -591,7 +654,7 @@ def get_gemini_response_safe(
 # -------------------------
 # Main UI
 # -------------------------
-def render_chatbot_interface(creds, api_key_func=None) -> None:
+def render_chatbot_interface(creds, api_key_func=None, history_save_func=None) -> None:
     """
     Renderizza il widget Chatbot in modalità Floating (FAB + Window).
     """
@@ -604,6 +667,8 @@ def render_chatbot_interface(creds, api_key_func=None) -> None:
         st.session_state.chat_is_responding = False
     if "pending_user_text" not in st.session_state:
         st.session_state.pending_user_text = None
+    if "chat_welcome_sent" not in st.session_state:
+        st.session_state.chat_welcome_sent = False
     if "utm_context" not in st.session_state:
         st.session_state.utm_context = {
             "current_step": 0,
@@ -796,6 +861,19 @@ def render_chatbot_interface(creds, api_key_func=None) -> None:
             border-bottom: 1px solid #1d4ed8;
             flex-shrink: 0;
         }
+        .debug-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            color: #1e3a8a;
+            background: #dbeafe;
+            border: 1px solid #bfdbfe;
+            border-radius: 999px;
+            padding: 4px 8px;
+            margin: 4px 8px 8px 8px;
+            width: fit-content;
+        }
 
         .msg-bubble {
             padding: 10px 14px;
@@ -860,6 +938,15 @@ def render_chatbot_interface(creds, api_key_func=None) -> None:
 
     # 2. CHAT WINDOW CONTAINER
     if st.session_state.chat_visible:
+        # Messaggio di benvenuto persistente alla prima apertura chat
+        if not st.session_state.chat_welcome_sent and not st.session_state.messages:
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": "Ciao! Sono il tuo assistente UTM 😊 Ti aiuterò a creare il link tracciato e ti guiderò passo dopo passo nella compilazione dei parametri."
+                }
+            )
+            st.session_state.chat_welcome_sent = True
         with st.container():
             st.markdown('<div class="chat-window-scope" style="display:none;"></div>', unsafe_allow_html=True)
             
@@ -1009,6 +1096,24 @@ def render_chatbot_interface(creds, api_key_func=None) -> None:
                                 tool_guess_property_from_url,
                             ]
 
+                            # Auto-select GA4 property from destination URL without asking user confirmation
+                            try:
+                                dest_url = utm_ctx["params"].get("destination_url")
+                                if dest_url and not utm_ctx.get("ga4_property_id"):
+                                    guessed = tool_guess_property_from_url(dest_url)
+                                    candidates = guessed.get("candidates", []) if isinstance(guessed, dict) else []
+                                    if candidates:
+                                        best = sorted(
+                                            candidates,
+                                            key=lambda x: (x.get("score", 0), bool(x.get("property_id"))),
+                                            reverse=True
+                                        )[0]
+                                        best_pid = best.get("property_id")
+                                        if best_pid:
+                                            utm_ctx["ga4_property_id"] = best_pid
+                            except Exception:
+                                pass
+
                             # --- Dynamic system instruction ---
                             current_date = datetime.now().strftime("%Y-%m-%d")
                             system_instruction = _build_system_instruction(utm_ctx, current_date)
@@ -1041,6 +1146,23 @@ def render_chatbot_interface(creds, api_key_func=None) -> None:
 
                             # Update conversation context
                             _update_context_from_response(response_text, pending_text, utm_ctx)
+
+                            # Salva automaticamente nello storico UTM, se disponibile un link finale.
+                            if callable(history_save_func):
+                                try:
+                                    final_url = _extract_first_url(cleaned or "")
+                                    if final_url and "utm_" in final_url:
+                                        saved = history_save_func(
+                                            final_url,
+                                            utm_ctx.get("ga4_property_id") or ""
+                                        )
+                                        if saved:
+                                            if hasattr(st, "toast"):
+                                                st.toast("Link salvato nello storico UTM", icon="✅")
+                                            else:
+                                                st.success("Link salvato nello storico UTM.")
+                                except Exception:
+                                    pass
 
                 except Exception as e:
                     st.session_state.messages.append({"role": "assistant", "content": f"Errore: {str(e)}"})
