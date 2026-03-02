@@ -1016,6 +1016,10 @@ def render_chatbot_interface(creds, api_key_func=None, history_save_func=None) -
                         else:
                             genai.configure(api_key=api_key)
                             utm_ctx = st.session_state.utm_context
+                            # Aggiorna subito il contesto col testo utente corrente
+                            # (cosi' destination_url e altri campi sono disponibili
+                            # prima dell'auto-selezione property GA4).
+                            _update_context_from_response("", pending_text, utm_ctx)
 
                             # --- TOOLS ---
                             def tool_list_properties() -> Any:
@@ -1152,6 +1156,24 @@ def render_chatbot_interface(creds, api_key_func=None, history_save_func=None) -
                                 try:
                                     final_url = _extract_first_url(cleaned or "")
                                     if final_url and "utm_" in final_url:
+                                        # Retry auto-selezione property se ancora mancante
+                                        # usando prima URL di destinazione, poi URL finale.
+                                        if not utm_ctx.get("ga4_property_id"):
+                                            try:
+                                                guess_url = utm_ctx["params"].get("destination_url") or final_url
+                                                guessed = tool_guess_property_from_url(guess_url)
+                                                candidates = guessed.get("candidates", []) if isinstance(guessed, dict) else []
+                                                if candidates:
+                                                    best = sorted(
+                                                        candidates,
+                                                        key=lambda x: (x.get("score", 0), bool(x.get("property_id"))),
+                                                        reverse=True
+                                                    )[0]
+                                                    best_pid = best.get("property_id")
+                                                    if best_pid:
+                                                        utm_ctx["ga4_property_id"] = best_pid
+                                            except Exception:
+                                                pass
                                         saved = history_save_func(
                                             final_url,
                                             utm_ctx.get("ga4_property_id") or ""

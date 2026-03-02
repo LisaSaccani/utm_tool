@@ -496,11 +496,16 @@ st.markdown("""
 
     div[data-testid="stTabs"] [data-baseweb="tab-list"],
     div[data-testid="stTabs"] [role="tablist"] {
-        gap: 8px;
-        background: transparent !important;
-        border-radius: 0;
-        padding: 0;
-        border: none !important;
+        display: flex !important;
+        justify-content: center !important;
+        align-items: center !important;
+        gap: 10px;
+        background: linear-gradient(180deg, #eef5ff 0%, #e8f1fe 100%) !important;
+        border: 1px solid #c8d9ee !important;
+        border-radius: 999px;
+        padding: 6px 8px;
+        width: fit-content;
+        margin: 8px auto 12px auto;
     }
 
     div[data-testid="stTabs"] > div,
@@ -511,20 +516,38 @@ st.markdown("""
         box-shadow: none !important;
         padding: 0 !important;
     }
+    div[data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+        display: none !important;
+    }
+    div[data-testid="stTabs"] [role="tabpanel"] {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        padding-top: 0 !important;
+    }
 
     div[data-testid="stTabs"] [data-baseweb="tab"],
     div[data-testid="stTabs"] [role="tab"] {
         border-radius: 999px;
-        padding: 8px 14px;
+        padding: 9px 18px;
         font-weight: 700;
-        color: #3b4a58;
+        color: #27425d;
+        border: 1px solid transparent;
+        background: transparent;
         transition: all .2s ease;
     }
 
     div[data-testid="stTabs"] [aria-selected="true"] {
         background: linear-gradient(120deg, var(--brand), var(--brand-strong));
         color: #fff !important;
-        box-shadow: 0 3px 8px rgba(0, 104, 201, 0.28);
+        border-color: #0b63c7;
+        box-shadow: 0 6px 14px rgba(11, 116, 229, 0.3);
+    }
+
+    div[data-testid="stTabs"] [data-baseweb="tab"]:hover,
+    div[data-testid="stTabs"] [role="tab"]:hover {
+        background: #f6faff;
+        border-color: #c8d9ee;
     }
 
     .stButton > button {
@@ -571,9 +594,10 @@ st.markdown("""
 
     /* Campi disabilitati (es. label utm_*) volutamente differenziati */
     div[data-testid="stTextInput"] input:disabled {
-        background: #e8f0fb !important;
-        border: 1px solid #d2dfef !important;
-        color: #5b7187 !important;
+        background: linear-gradient(180deg, #dce9f9 0%, #cfdef2 100%) !important;
+        border: 1px solid #a9c2de !important;
+        color: #2f4d69 !important;
+        font-weight: 600 !important;
     }
 
     div[data-testid="stTextInput"] label,
@@ -1213,7 +1237,7 @@ def show_dashboard():
 
     st.markdown("""
     <div class="hero">
-        <div class="hero-title">UTM Builder</div>
+        <div class="hero-title">Smart UTM Assistant</div>
         <div class="hero-sub">Il collegamento live a GA4 e il chatbot ti guideranno nella creazione</div>
         <div class="hero-desc">Questo tool ti permette di creare e validare link UTM con una guida passo-passo del chatbot, mentre legge in tempo reale la property GA4 selezionata per mostrarti sorgenti e convenzioni realmente usate nelle campagne.</div>
         <div class="chip-row">
@@ -1252,9 +1276,8 @@ def show_dashboard():
     # TAB 1: UTM GENERATOR (BUILDER)
     # ==============================================================================
     with tab_builder:
-        st.markdown('<div class="tilda-panel">', unsafe_allow_html=True)
         st.markdown('<div class="tilda-title">Campaign URL Builder</div>', unsafe_allow_html=True)
-        st.markdown('<div class="tilda-sub">Guidato dal chatbot e collegato alla property GA4 selezionata.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="tilda-sub">Seleziona la property GA4 di riferimento per caricare source e medium reali.</div>', unsafe_allow_html=True)
 
         selected_prop_name = None
         sel_prop_id = None
@@ -1693,11 +1716,6 @@ def show_dashboard():
 
         with st.expander("📘 Tabella guida parametri UTM"):
             st.table(pd.DataFrame(GUIDE_TABLE_DATA))
-
-        st.markdown('</div>', unsafe_allow_html=True)
-
-
-
 
     # ==============================================================================
     # TAB 2: UTM CHECKER (CORRETTO E PULITO)
