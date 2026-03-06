@@ -1166,6 +1166,11 @@ def show_login_page():
         flow = get_oauth_flow()
         if flow:
             auth_url, _ = flow.authorization_url(prompt='consent')
+            
+            # Save the code verifier in session state before redirect
+            if hasattr(flow, 'code_verifier'):
+                st.session_state['code_verifier'] = flow.code_verifier
+
             st.link_button("🔐 Login con Google Analytics", auth_url, type="primary", use_container_width=True)
         else:
             st.error("Configurazione Google Auth mancante.")
@@ -1973,6 +1978,10 @@ if __name__ == "__main__":
             flow = get_oauth_flow()
             if flow:
                 try:
+                    # Restore the PKCE code_verifier from the session state if exists
+                    if 'code_verifier' in st.session_state:
+                         flow.code_verifier = st.session_state['code_verifier']
+
                     flow.fetch_token(code=auth_code)
                     creds = flow.credentials
                     st.session_state.credentials = creds
