@@ -21,7 +21,7 @@ from google.analytics.data import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import RunReportRequest, DateRange, Metric, Dimension
 
 import google.generativeai as genai
-from googleapi import get_persistent_api_key, save_persistent_api_key
+from googleapi import get_persistent_api_key, save_persistent_api_key, get_user_email
 import ga4_mcp_tools # Import tools module
 from functools import partial
 
